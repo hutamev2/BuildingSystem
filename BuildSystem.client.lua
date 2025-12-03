@@ -1,10 +1,3 @@
---[[
-This code is written for the application
-Only local script is used
-I did not want to go into too much detail 
-Because I did not use a module script
---]]
-
 --// Services
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
@@ -27,7 +20,6 @@ local POOL_SIZE = 10
 
 local localPlayer: Player = Players.LocalPlayer
 local camera: Camera = workspace.CurrentCamera
-
 local buildablesFolder: Folder? = ReplicatedStorage:FindFirstChild("Buildables")
 
 --// State Variables
@@ -48,11 +40,12 @@ local keyHoldState: {[string]: boolean} = {
     undoLast = false
 }
 
---// Timing Variables
 local lastRotationTime: number = 0
 local lastUndoTime: number = 0
 
---// Object Pool for Performance Optimization
+--// Object Pool Implementation
+-- Reduces memory allocation by reusing destroyed objects
+-- This prevents frame drops from garbage collection spikes
 local ObjectPool = {}
 ObjectPool.__index = ObjectPool
 
@@ -96,10 +89,9 @@ function ObjectPool:clear()
     self.activeCount = 0
 end
 
---// Initialize Object Pool
 local buildObjectPool = ObjectPool.new(POOL_SIZE)
 
---// Placed Object Metatable for Management
+--// Placed Object Wrapper
 local PlacedObject = {}
 PlacedObject.__index = PlacedObject
 
@@ -124,40 +116,45 @@ function PlacedObject:getAge(): number
     return tick() - self.timestamp
 end
 
--- Snaps a value to the nearest grid point
+
+-- Grid snapping algorithm: rounds value to nearest grid interval
+-- Example: snapToGrid(7.3, 2) = 8, snapToGrid(6.8, 2) = 6
 local function snapToGrid(value: number, gridInterval: number): number
     return math.floor((value + gridInterval * 0.5) / gridInterval) * gridInterval
 end
 
+-- Surface alignment algorithm using cross products
+-- Creates proper rotation matrix so objects sit flush on walls/ceilings
+-- Process: 1) Use surface normal as "up", 2) Cross with world X to get "right"
+-- 3) Cross right×up to get "look", 4) Build CFrame from these vectors
 local function calculateSurfaceAlignment(position: Vector3, normalVector: Vector3): CFrame
     if not normalVector or normalVector.Magnitude == 0 then
         return CFrame.new(position)
     end
 
-    -- Normalize the surface normal to get the up vector
     local upVector: Vector3 = normalVector.Unit
 
-    -- Calculate right vector using cross product with world x axis
+    -- Cross product with world X axis to get perpendicular vector
     local rightVector: Vector3 = Vector3.new(1, 0, 0):Cross(upVector)
 
-    -- Handle edge case where normal is parallel to x axis
+    -- Edge case: if normal is parallel to X axis, cross product becomes zero
+    -- Use Z axis instead to get valid perpendicular vector
     if rightVector.Magnitude < 0.001 then
         rightVector = Vector3.new(0, 0, 1):Cross(upVector)
     end
 
     rightVector = rightVector.Unit
-
-    -- Calculate look vectr
     local lookVector: Vector3 = rightVector:Cross(upVector).Unit
 
-    -- Offset position sligtly above the surface
+    -- Offset prevents z-fighting (visual flickering when surfaces overlap)
     local offsetPosition: Vector3 = position + (upVector * SURFACE_SNAP_OFFSET)
 
-    -- Construct CFrame from matrix components
     return CFrame.fromMatrix(offsetPosition, rightVector, upVector)
 end
 
--- Performs collision detecion within a radius
+-- Spatial collision detection using sphere overlap
+-- Much faster than raycasting in all directions - single API call checks all parts
+-- Only checks tagged "BuildingPart" objects using CollectionService for efficiency
 local function checkCollisionInRadius(position: Vector3, radius: number): boolean
     local overlapParams = OverlapParams.new()
     overlapParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -174,7 +171,8 @@ local function checkCollisionInRadius(position: Vector3, radius: number): boolea
     return false
 end
 
--- Casts a ray from camera through mouse position
+-- Raycasting from camera through mouse position
+-- Converts 2D screen coordinates to 3D world ray
 local function performMouseRaycast(ignoreList: {Instance}): RaycastResult?
     local mousePosition: Vector2 = UserInputService:GetMouseLocation()
     local screenRay: Ray = camera:ScreenPointToRay(mousePosition.X, mousePosition.Y)
@@ -188,7 +186,6 @@ local function performMouseRaycast(ignoreList: {Instance}): RaycastResult?
     return workspace:Raycast(screenRay.Origin, rayDirection, raycastParams)
 end
 
--- Clears the current preview object
 local function clearActivePreview()
     if activePreview then
         activePreview:Destroy()
@@ -199,13 +196,13 @@ local function clearActivePreview()
     lastSurfaceNormal = nil
 end
 
--- Creates a transparent preview of the selected buildable
 local function createBuildPreview(templateModel: Model)
     if not templateModel then return end
     clearActivePreview()
 
     local previewModel: Model = templateModel:Clone()
 
+    -- PrimaryPart is required for PivotTo to work correctly
     if not previewModel.PrimaryPart then
         for _, descendant in pairs(previewModel:GetDescendants()) do
             if descendant:IsA("BasePart") then
@@ -215,7 +212,6 @@ local function createBuildPreview(templateModel: Model)
         end
     end
 
-    -- Configure all parts in the preview
     for _, descendant in pairs(previewModel:GetDescendants()) do
         if descendant:IsA("BasePart") then
             descendant.CanCollide = false
@@ -231,6 +227,11 @@ local function createBuildPreview(templateModel: Model)
     currentTemplateName = templateModel.Name
 end
 
+-- Preview positioning system with three fallback modes:
+-- 1. Direct surface hit - snap to surface with alignment
+-- 2. Cached surface - use last known surface (smooth when mouse leaves briefly)  
+-- 3. Fixed distance - place at MAX_RAYCAST_DISTANCE from camera
+-- This creates forgiving UX where preview doesn't jump erratically
 local function updatePreviewPosition()
     if not isBuildModeEnabled or not activePreview then return end
 
@@ -239,13 +240,15 @@ local function updatePreviewPosition()
     local targetCFrame: CFrame
 
     if raycastResult and raycastResult.Instance:IsA("BasePart") then
-        -- Mouse is over a part - snap to surface
+        -- Mode 1: Direct surface hit
         lastSurfacePosition = raycastResult.Position
         lastSurfaceNormal = raycastResult.Normal
         targetCFrame = calculateSurfaceAlignment(lastSurfacePosition, lastSurfaceNormal)
     elseif lastSurfacePosition and lastSurfaceNormal then
+        -- Mode 2: Use cached surface for smooth placement
         targetCFrame = calculateSurfaceAlignment(lastSurfacePosition, lastSurfaceNormal)
     else
+        -- Mode 3: Fallback to camera-relative placement
         local cameraPosition: Vector3 = camera.CFrame.Position
         local cameraLookVector: Vector3 = camera.CFrame.LookVector
         local targetPosition: Vector3 = cameraPosition + cameraLookVector * MAX_RAYCAST_DISTANCE
@@ -257,25 +260,28 @@ local function updatePreviewPosition()
         )
     end
 
-    -- Apply rotation to the target CFrame
+    -- Only rotate around Y axis to keep objects upright on surfaces
     local rotatedCFrame: CFrame = targetCFrame * CFrame.Angles(0, math.rad(currentRotation), 0)
     activePreview:PivotTo(rotatedCFrame)
 end
 
+-- Placement process: collision check -> clone preview -> configure physics ->  track for undo
+-- Resets all physics properties to prevent objects spawning with momentum
 local function placeCurrentObject()
     if not activePreview then return end
 
     local placementCFrame: CFrame = activePreview:GetPivot()
 
-    -- Check for collisions before placing
+    -- Prevent overlapping placements
     if checkCollisionInRadius(placementCFrame.Position, COLLISION_CHECK_RADIUS) then
-        warn("collision detected")
+        warn("Collision detected")
         return
     end
 
     local newObject: Model = activePreview:Clone()
     newObject.Name = "Placed_" .. currentTemplateName
 
+    -- Convert from ghost preview to solid physical object
     for _, descendant in pairs(newObject:GetDescendants()) do
         if descendant:IsA("BasePart") then
             descendant.Transparency = 0
@@ -284,6 +290,7 @@ local function placeCurrentObject()
             descendant.Velocity = Vector3.zero
             descendant.AssemblyAngularVelocity = Vector3.zero
             descendant.Material = Enum.Material.Plastic
+            -- Tag enables efficient collision queries
             CollectionService:AddTag(descendant, "BuildingPart")
         end
     end
@@ -291,15 +298,13 @@ local function placeCurrentObject()
     newObject.Parent = workspace
     newObject:PivotTo(placementCFrame)
 
-
     local placedObjectData = PlacedObject.new(newObject, placementCFrame, currentRotation)
     table.insert(placedObjectsList, placedObjectData)
 
     Debris:AddItem(newObject, OBJECT_LIFETIME)
-
 end
 
--- Removes the most recently placed object
+-- Stack-based undo system
 local function undoLastPlacement()
     local objectCount: number = #placedObjectsList
     if objectCount > 0 then
@@ -309,7 +314,6 @@ local function undoLastPlacement()
     end
 end
 
--- Toggles building mode 
 local function toggleBuildMode()
     isBuildModeEnabled = not isBuildModeEnabled
 
@@ -322,7 +326,7 @@ local function toggleBuildMode()
     end
 end
 
--- Cycles through available buildable objects
+-- Circlar array navigation with modulo arithmetic for wrap-around
 local function cycleBuildableObject(direction: number)
     if #availableBuildables == 0 then return end
 
@@ -333,7 +337,7 @@ local function cycleBuildableObject(direction: number)
     end
 end
 
--- Load all available buildables from ReplicatedStorage
+--// Load Buildables
 if buildablesFolder then
     for _, item in pairs(buildablesFolder:GetChildren()) do
         if item:IsA("Model") then
@@ -346,6 +350,7 @@ if buildablesFolder then
     end)
 end
 
+--// Input Hndling
 
 UserInputService.InputBegan:Connect(function(inputObject: InputObject, gameProcessedEvent: boolean)
     if gameProcessedEvent then return end
@@ -384,13 +389,14 @@ UserInputService.InputChanged:Connect(function(inputObject: InputObject, gamePro
     end
 end)
 
-
+-- Main update loop runs every frame before rendering
+-- Processes held keys with timea based delays to control action frequency
 RunService.RenderStepped:Connect(function()
     updatePreviewPosition()
 
     local currentTime: number = tick()
 
-    -- Handle continuous rotation when key is held
+    -- Time gated rotation prevents uncontrollable spinning
     if keyHoldState.rotateLeft and currentTime - lastRotationTime >= ROTATION_DELAY then
         currentRotation = (currentRotation - ROTATION_STEP) % 360
         lastRotationTime = currentTime
@@ -399,15 +405,14 @@ RunService.RenderStepped:Connect(function()
         lastRotationTime = currentTime
     end
 
-    -- Handle continuous undo when key is held
+    -- Time gated undo allows rapid but controlled deletion
     if keyHoldState.undoLast and currentTime - lastUndoTime >= UNDO_DELAY then
         undoLastPlacement()
         lastUndoTime = currentTime
     end
 end)
 
---// Cleanup Player
-
+--// Cleanup
 Players.PlayerRemoving:Connect(function(removingPlayer: Player)
     if removingPlayer == localPlayer then
         clearActivePreview()
